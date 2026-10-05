@@ -1,3 +1,5 @@
+import time
+import uuid
 from asgiref.sync import sync_to_async
 from django.test import TransactionTestCase
 from django.db import connections
@@ -15,6 +17,7 @@ from leaderboards.services import LeaderboardRedisService
 from leaderboards.models import ArchivedLeaderboardEntry
 from channels.testing import WebsocketCommunicator
 from config.asgi import application 
+from leaderboards.security import generate_hmac_signature
 
 
 class RealTimeLeaderboardTests(TestCase):
@@ -478,3 +481,110 @@ class SocialLeaderboardTests(TestCase):
         charlie_entry = next(entry for entry in data if entry['player_id'] == 'p3')
         self.assertEqual(charlie_entry['local_rank'], 3)
         self.assertEqual(charlie_entry['global_rank'], 4)
+
+
+
+class LeaderboardSecurityTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.fake_redis = fakeredis.FakeRedis(decode_responses=True)
+
+        self.redis_patcher = patch(
+            'leaderboards.security.get_redis_client',
+            return_value=self.fake_redis
+        )
+        self.views_redis_patcher = patch(
+            'leaderboards.views.get_redis_client',
+            return_value=self.fake_redis
+        )
+        self.redis_patcher.start()
+        self.views_redis_patcher.start()
+
+        self.game = Game.objects.create(name="SecureDash")
+        self.player = Player.objects.create(id="soldier_76", username="Jack")
+        cache.clear()
+
+    def tearDown(self):
+        self.redis_patcher.stop()
+        self.views_redis_patcher.stop()
+        cache.clear()
+
+    def _build_signed_request(self, score=500.0, timestamp=None, nonce=None):
+        if timestamp is None:
+            timestamp = int(time.time())
+        if nonce is None:
+            nonce = uuid.uuid4().hex
+
+        payload = {
+            'game': str(self.game.id),
+            'player': self.player.id,
+            'score': score
+        }
+
+        signature = generate_hmac_signature(
+            secret=self.game.api_secret,
+            game_id=str(self.game.id),
+            player_id=self.player.id,
+            score=score,
+            timestamp=timestamp,
+            nonce=nonce
+        )
+
+        headers = {
+            'HTTP_X_SIGNATURE': signature,
+            'HTTP_X_TIMESTAMP': str(timestamp),
+            'HTTP_X_NONCE': nonce
+        }
+        return payload, headers
+
+    def test_valid_hmac_signature_succeeds(self):
+        """A properly signed request within time tolerance must pass."""
+        payload, headers = self._build_signed_request(score=250.0)
+        response = self.client.post('/api/leaderboards/scores/', payload, **headers)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['score'], 250.0)
+
+    def test_tampered_payload_is_rejected(self):
+        """If an attacker modifies the score in flight, verification must fail."""
+        payload, headers = self._build_signed_request(score=100.0)
+        # Attacker modifies the score to 99999 without updating HMAC
+        payload['score'] = 99999.0
+
+        response = self.client.post('/api/leaderboards/scores/', payload, **headers)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("Invalid HMAC signature", response.data['detail'])
+
+    def test_expired_timestamp_is_rejected(self):
+        """Requests older than 30 seconds must be rejected."""
+        old_timestamp = int(time.time()) - 45  # 45 seconds ago
+        payload, headers = self._build_signed_request(score=100.0, timestamp=old_timestamp)
+
+        response = self.client.post('/api/leaderboards/scores/', payload, **headers)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("expired or skewed", response.data['detail'])
+
+    def test_nonce_replay_attack_is_blocked(self):
+        """Submitting the exact same nonce twice within the window must be rejected."""
+        fixed_nonce = "static_nonce_12345"
+        payload, headers = self._build_signed_request(score=300.0, nonce=fixed_nonce)
+
+        # First request succeeds
+        resp1 = self.client.post('/api/leaderboards/scores/', payload, **headers)
+        self.assertEqual(resp1.status_code, status.HTTP_201_CREATED)
+
+        # Second request with the same nonce is blocked
+        resp2 = self.client.post('/api/leaderboards/scores/', payload, **headers)
+        self.assertEqual(resp2.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("Replay attack detected", response_detail := resp2.data['detail'])
+
+    def test_rate_limit_exceeded_triggers_429(self):
+        """Submitting more than 10 requests within a minute must trigger HTTP 429."""
+        for i in range(10):
+            payload, headers = self._build_signed_request(score=float(100 + i))
+            res = self.client.post('/api/leaderboards/scores/', payload, **headers)
+            self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+        # 11th request must be throttled
+        payload, headers = self._build_signed_request(score=999.0)
+        res11 = self.client.post('/api/leaderboards/scores/', payload, **headers)
+        self.assertEqual(res11.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
