@@ -1,6 +1,9 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
+from asgiref.sync import async_to_sync
+from channels.layers import get_channel_layer
+
 from .models import ScoreSubmission
 from .serializers import (
     ScoreSubmissionSerializer,
@@ -10,26 +13,58 @@ from .serializers import (
 from .services import LeaderboardRedisService, get_redis_client
 
 class SubmitScoreView(APIView):
-    """Requirement 1 & 4: Ingests score and updates Redis in <1s."""
+    """
+    Ingests score, updates Redis real-time indices, and broadcasts
+    the rank update to WebSocket listeners via Redis Pub/Sub.
+    """
     def post(self, request):
         serializer = ScoreSubmissionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         submission = serializer.save()
 
-        # Update Redis real-time indices immediately
+        game_id = str(submission.game_id)
+        player_id = str(submission.player_id)
+        score = submission.score
+
+        # 1. Update Redis sorted sets
         r = get_redis_client()
         LeaderboardRedisService.record_score(
             r=r,
-            game_id=str(submission.game_id),
-            player_id=str(submission.player_id),
-            score=submission.score
+            game_id=game_id,
+            player_id=player_id,
+            score=score
         )
+
+        # 2. Broadcast updates to active WebSocket subscribers
+        channel_layer = get_channel_layer()
+        periods = ['daily', 'weekly', 'all_time']
+
+        for period in periods:
+            key = LeaderboardRedisService.get_key_for_period(game_id, period)
+            player_rank = LeaderboardRedisService.calculate_rank(r, key, score)
+            top_10 = LeaderboardRedisService.get_top_n(r, key, 10)
+
+            payload = {
+                "player_id": player_id,
+                "score": score,
+                "rank": player_rank,
+                "period": period,
+                "top_10": top_10
+            }
+
+            group_name = f"leaderboard_{game_id}_{period}"
+            async_to_sync(channel_layer.group_send)(
+                group_name,
+                {
+                    "type": "leaderboard_update",
+                    "payload": payload,
+                }
+            )
 
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
 class TopNLeaderboardView(APIView):
-    """Requirement 2 & 5: Returns top N players with rank, score, percentile."""
     def get(self, request, game_id):
         limit = int(request.query_params.get('limit', 10))
         period = request.query_params.get('period', 'all_time')
@@ -50,7 +85,6 @@ class TopNLeaderboardView(APIView):
 
 
 class PlayerRankContextView(APIView):
-    """Requirement 3: Returns player's rank + neighbors directly above and below."""
     def get(self, request, game_id, player_id):
         period = request.query_params.get('period', 'all_time')
         r = get_redis_client()
@@ -68,7 +102,6 @@ class PlayerRankContextView(APIView):
 
 
 class PaginatedLeaderboardView(APIView):
-    """Requirement 6: Paginated leaderboard isolated by snapshot against score drift."""
     def get(self, request, game_id):
         period = request.query_params.get('period', 'all_time')
         page = max(1, int(request.query_params.get('page', 1)))

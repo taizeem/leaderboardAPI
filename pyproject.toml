@@ -3,6 +3,9 @@ name = "api"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
+    "channels>=4.3.2",
+    "channels-redis>=4.3.0",
+    "daphne>=4.2.3",
     "django>=6.1.1",
     "django-redis>=7.0.0",
     "djangorestframework>=3.18.1",
