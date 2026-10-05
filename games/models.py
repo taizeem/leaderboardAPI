@@ -7,6 +7,7 @@ def generate_api_secret():
 class Game(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=100, unique=True)
+    api_secret = models.CharField(max_length=64, default=generate_api_secret)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):

@@ -45,11 +45,13 @@ def enrich_player_metadata(entries: list) -> list:
     return entries
 class SubmitScoreView(APIView):
     """
-    Ingests score, updates Redis real-time indices, and broadcasts
-    the rank update to WebSocket listeners via Redis Pub/Sub.
+    Ingests score, updates Redis real-time indices, broadcasts live updates
+    over WebSockets, and returns the player's updated standings.
+    Protected by HMAC-SHA256 signature verification and scoped rate limiting.
     """
     permission_classes = [HasValidHMACSignature]
-    throttle_classes= [PlayerScoreThrottle]
+    throttle_classes = [PlayerScoreThrottle]
+
     def post(self, request):
         serializer = ScoreSubmissionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -68,44 +70,46 @@ class SubmitScoreView(APIView):
             score=score
         )
 
-        # 2. Broadcast updates to active WebSocket subscribers
-        periods = ['daily', 'weekly', 'all_time']
+        # 2. Gather standings & broadcast WebSocket updates in a single loop
+        channel_layer = get_channel_layer()
         standings_summary = {}
+        periods = ['daily', 'weekly', 'all_time']
 
         for period in periods:
             key = LeaderboardRedisService.get_key_for_period(game_id, period)
             rank = LeaderboardRedisService.calculate_rank(r, key, score)
             percentile = LeaderboardRedisService.calculate_percentile(r, key, score)
+            
             standings_summary[period] = {
                 'rank': rank,
                 'percentile': percentile
             }
-            channel_layer = get_channel_layer()
-            if channel_layer:
-                for period in periods:
-                    key = LeaderboardRedisService.get_key_for_period(game_id, period)
-                    top_10 = LeaderboardRedisService.get_top_n(r, key, 10)
-                    enrich_player_metadata(top_10)
 
-                    payload = {
-                        "player_id": player_id,
-                        "score": score,
-                        "rank": standings_summary[period]['rank'],
-                        "percentile": standings_summary[period]['percentile'],
-                        "period": period,
-                        "top_10": top_10
+            if channel_layer:
+                top_10 = LeaderboardRedisService.get_top_n(r, key, 10)
+                enrich_player_metadata(top_10)
+
+                payload = {
+                    "player_id": player_id,
+                    "score": score,
+                    "rank": rank,
+                    "percentile": percentile,
+                    "period": period,
+                    "top_10": top_10
+                }
+                group_name = f"leaderboard_{game_id}_{period}"
+                async_to_sync(channel_layer.group_send)(
+                    group_name,
+                    {
+                        "type": "leaderboard_update",
+                        "payload": payload,
                     }
-                    group_name = f"leaderboard_{game_id}_{period}"
-                    async_to_sync(channel_layer.group_send)(
-                        group_name,
-                        {
-                            "type": "leaderboard_update",
-                            "payload": payload,
-                        }
-                    )
+                )
+
+        # 3. Return response with current standings
         response_data = serializer.data
         response_data['current_standings'] = standings_summary
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(response_data, status=status.HTTP_201_CREATED)
 
 
 class TopNLeaderboardView(APIView):

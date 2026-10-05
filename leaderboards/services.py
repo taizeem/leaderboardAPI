@@ -23,24 +23,25 @@ class LeaderboardRedisService:
         'all_time': None,        # All-time board does not expire
     }
 
-    @staticmethod
-    def get_period_keys(game_id: str, dt: datetime = None) -> dict:
-        if dt is None:
-            dt = datetime.now(timezone.utc)
-        daily_str = dt.strftime('%Y-%m-%d')
-        weekly_str = dt.strftime('%Y-W%W')
+    @classmethod
+    def get_period_keys(cls, game_id: str) -> dict:
+        now = datetime.now(timezone.utc)
+        today = now.strftime('%Y-%m-%d')
+        year_week = now.strftime('%Y-%W')
         return {
-            'daily': f"lb:{game_id}:daily:{daily_str}",
-            'weekly': f"lb:{game_id}:weekly:{weekly_str}",
+            'daily': f"lb:{game_id}:daily:{today}",
+            'weekly': f"lb:{game_id}:weekly:{year_week}",
             'all_time': f"lb:{game_id}:all_time",
         }
 
     @classmethod
-    def get_key_for_period(cls, game_id: str, period: str, dt: datetime = None) -> str:
-        keys = cls.get_period_keys(game_id, dt)
-        if period not in keys:
-            raise ValueError(f"Invalid period: {period}. Must be one of {list(keys.keys())}")
-        return keys[period]
+    def get_key_for_period(cls, game_id: str, period: str) -> str:
+        keys = cls.get_period_keys(game_id)
+        if period in keys:
+            return keys[period]
+        if period == 'week':
+            return keys['weekly']
+        raise ValueError(f"Invalid period: '{period}'. Must be 'daily', 'weekly', or 'all_time'.")
 
     @classmethod
     def record_score(cls, r: redis.Redis, game_id: str, player_id: str, score: float):
