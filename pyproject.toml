@@ -10,6 +10,7 @@ dependencies = [
     "django-redis>=7.0.0",
     "djangorestframework>=3.18.1",
     "fakeredis>=2.39.0",
+    "locust>=2.46.7",
     "psycopg[binary]>=3.3.6",
     "python-dotenv>=1.2.4",
     "redis>=8.1.0",
