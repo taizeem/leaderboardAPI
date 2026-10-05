@@ -1,3 +1,4 @@
+from unittest.mock import patch
 from datetime import datetime, timezone, timedelta
 from io import StringIO
 import fakeredis
@@ -9,6 +10,9 @@ from rest_framework import status
 from games.models import Game, Player
 from leaderboards.services import LeaderboardRedisService
 from leaderboards.models import ArchivedLeaderboardEntry
+from channels.testing import WebsocketCommunicator
+from config.asgi import application 
+
 
 class RealTimeLeaderboardTests(TestCase):
     def setUp(self):
@@ -300,3 +304,69 @@ class ArchivingAndTTLTests(TestCase):
         )
         # Active key remains untouched in Redis
         self.assertTrue(self.fake_redis.exists(today_key))
+
+
+class LeaderboardWebSocketTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.fake_redis = fakeredis.FakeRedis(decode_responses=True)
+
+        self.redis_patcher = patch(
+            'leaderboards.views.get_redis_client',
+            return_value=self.fake_redis
+        )
+        self.consumer_redis_patcher = patch(
+            'leaderboards.consumers.get_redis_client',
+            return_value=self.fake_redis
+        )
+        self.redis_patcher.start()
+        self.consumer_redis_patcher.start()
+
+        self.game = Game.objects.create(name="CyberArena")
+        self.player = Player.objects.create(id="neon_1", username="NeonRider")
+
+    def tearDown(self):
+        self.redis_patcher.stop()
+        self.consumer_redis_patcher.stop()
+
+    async def test_websocket_connect_and_receives_initial_state(self):
+        """Verifies WebSocket accepts connection and delivers initial leaderboard data."""
+        path = f"/ws/leaderboards/{self.game.id}/all_time/"
+        communicator = WebsocketCommunicator(application, path)
+        connected, _ = await communicator.connect()
+        self.assertTrue(connected)
+
+        # First message must be initial state
+        response = await communicator.receive_json_from()
+        self.assertEqual(response["type"], "initial_state")
+        self.assertEqual(response["period"], "all_time")
+        self.assertIsInstance(response["data"], list)
+
+        await communicator.disconnect()
+
+    async def test_score_submission_triggers_live_websocket_broadcast(self):
+        """Posting a score via HTTP endpoint must push a live update down the WebSocket."""
+        path = f"/ws/leaderboards/{self.game.id}/all_time/"
+        communicator = WebsocketCommunicator(application, path)
+        connected, _ = await communicator.connect()
+        self.assertTrue(connected)
+
+        # Discard initial state message
+        await communicator.receive_json_from()
+
+        # Submit score via HTTP endpoint
+        resp = self.client.post('/api/leaderboards/scores/', {
+            'game': str(self.game.id),
+            'player': self.player.id,
+            'score': 850.0
+        })
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+        # Verify broadcast received on WebSocket
+        broadcast = await communicator.receive_json_from()
+        self.assertEqual(broadcast["type"], "rank_update")
+        self.assertEqual(broadcast["payload"]["player_id"], "neon_1")
+        self.assertEqual(broadcast["payload"]["score"], 850.0)
+        self.assertEqual(broadcast["payload"]["rank"], 1)
+
+        await communicator.disconnect()
