@@ -1,10 +1,14 @@
+from datetime import datetime, timezone, timedelta
+from io import StringIO
 import fakeredis
 from unittest.mock import patch
+from django.core.management import call_command
 from django.test import TestCase
 from rest_framework.test import APIClient
 from rest_framework import status
 from games.models import Game, Player
 from leaderboards.services import LeaderboardRedisService
+from leaderboards.models import ArchivedLeaderboardEntry
 
 class RealTimeLeaderboardTests(TestCase):
     def setUp(self):
@@ -200,3 +204,99 @@ class RealTimeLeaderboardTests(TestCase):
         p1_ids = {item['player_id'] for item in page1_items}
         p2_ids = {item['player_id'] for item in page2_items}
         self.assertTrue(p1_ids.isdisjoint(p2_ids))
+
+class ArchivingAndTTLTests(TestCase):
+    def setUp(self):
+        self.fake_redis = fakeredis.FakeRedis(decode_responses=True)
+        self.redis_patcher = patch(
+            'leaderboards.views.get_redis_client',
+            return_value=self.fake_redis
+        )
+        self.redis_service_patcher = patch(
+            'leaderboards.management.commands.archive_leaderboards.get_redis_client',
+            return_value=self.fake_redis
+        )
+        self.redis_patcher.start()
+        self.redis_service_patcher.start()
+
+        self.game = Game.objects.create(name="SpeedRunner")
+        self.p1 = Player.objects.create(id="u1", username="P1")
+        self.p2 = Player.objects.create(id="u2", username="P2")
+        self.p3 = Player.objects.create(id="u3", username="P3")
+
+    def tearDown(self):
+        self.redis_patcher.stop()
+        self.redis_service_patcher.stop()
+
+    def test_automatic_ttl_on_score_submission(self):
+        """Verify daily and weekly sets have TTLs set, while all_time has no TTL."""
+        LeaderboardRedisService.record_score(
+            r=self.fake_redis,
+            game_id=str(self.game.id),
+            player_id=self.p1.id,
+            score=50.0
+        )
+
+        keys = LeaderboardRedisService.get_period_keys(str(self.game.id))
+
+        # Daily key should have a TTL (~7 days = 604800s)
+        daily_ttl = self.fake_redis.ttl(keys['daily'])
+        self.assertGreater(daily_ttl, 0)
+        self.assertLessEqual(daily_ttl, 604800)
+
+        # Weekly key should have a TTL (~35 days = 3024000s)
+        weekly_ttl = self.fake_redis.ttl(keys['weekly'])
+        self.assertGreater(weekly_ttl, 0)
+        self.assertLessEqual(weekly_ttl, 3024000)
+
+        # All-time key must not expire (ttl == -1 in Redis)
+        all_time_ttl = self.fake_redis.ttl(keys['all_time'])
+        self.assertEqual(all_time_ttl, -1)
+
+    def test_archive_command_archives_closed_periods_with_competition_ranks(self):
+        """Past daily leaderboard is archived to PostgreSQL with tie handling and deleted from Redis."""
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        yesterday_str = yesterday.strftime('%Y-%m-%d')
+        past_key = f"lb:{self.game.id}:daily:{yesterday_str}"
+
+        # Seed past scores with a tie: u1=300, u2=300, u3=150
+        self.fake_redis.zadd(past_key, {self.p1.id: 300.0, self.p2.id: 300.0, self.p3.id: 150.0})
+
+        # Run command with --delete-redis
+        out = StringIO()
+        call_command('archive_leaderboards', '--delete-redis', stdout=out)
+
+        # Assert PostgreSQL records exist
+        archived_records = ArchivedLeaderboardEntry.objects.filter(
+            game=self.game,
+            period_type='daily',
+            period_identifier=yesterday_str
+        ).order_by('rank')
+
+        self.assertEqual(archived_records.count(), 3)
+
+        # Verify ties: u1 and u2 tied at rank 1, u3 skips to rank 3
+        rank_map = {entry.player_id: entry.rank for entry in archived_records}
+        self.assertEqual(rank_map['u1'], 1)
+        self.assertEqual(rank_map['u2'], 1)
+        self.assertEqual(rank_map['u3'], 3)
+
+        # Redis key must be deleted
+        self.assertFalse(self.fake_redis.exists(past_key))
+
+    def test_archive_command_skips_active_today_period(self):
+        """Current today's daily leaderboard must NOT be archived prematurely."""
+        today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        today_key = f"lb:{self.game.id}:daily:{today_str}"
+        self.fake_redis.zadd(today_key, {self.p1.id: 500.0})
+
+        out = StringIO()
+        call_command('archive_leaderboards', stdout=out)
+
+        # Should not create any rows for today
+        self.assertEqual(
+            ArchivedLeaderboardEntry.objects.filter(period_identifier=today_str).count(),
+            0
+        )
+        # Active key remains untouched in Redis
+        self.assertTrue(self.fake_redis.exists(today_key))
