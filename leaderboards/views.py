@@ -3,6 +3,9 @@ from rest_framework.response import Response
 from rest_framework import status
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
+from django.db.models import Q
+from games.models import Clan, Friendship, Player
+from .serializers import FilteredLeaderboardResponseSerializer
 
 from .models import ScoreSubmission
 from .serializers import (
@@ -123,3 +126,81 @@ class PaginatedLeaderboardView(APIView):
         )
 
         return Response(data)
+
+class FriendsLeaderboardView(APIView):
+    """
+    Returns the leaderboard filtered to only the player's friends + the player themselves.
+    """
+    def get(self, request, game_id, player_id):
+        period = request.query_params.get('period', 'all_time')
+
+        # 1. Fetch friend IDs (bidirectional: player is in 'player' or 'friend' column)
+        friend_ids = list(Friendship.objects.filter(player_id=player_id).values_list('friend_id', flat=True))
+        reverse_friend_ids = list(Friendship.objects.filter(friend_id=player_id).values_list('player_id', flat=True))
+        
+        # Include all unique friends + the requesting player
+        all_ids = list(set(friend_ids + reverse_friend_ids + [player_id]))
+
+        # 2. Redis lookup
+        r = get_redis_client()
+        try:
+            key = LeaderboardRedisService.get_key_for_period(game_id, period)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        entries = LeaderboardRedisService.get_subset_leaderboard(
+            r=r,
+            key=key,
+            player_ids=all_ids,
+            target_player_id=player_id
+        )
+
+        response_payload = {
+            'game_id': str(game_id),
+            'filter_type': 'friends',
+            'filter_entity_id': player_id,
+            'period': period,
+            'total_active_members': len(entries),
+            'leaderboard': entries
+        }
+        return Response(response_payload)
+
+
+class ClanLeaderboardView(APIView):
+    """
+    Returns the leaderboard filtered to members of a specific clan.
+    """
+    def get(self, request, game_id, clan_id):
+        period = request.query_params.get('period', 'all_time')
+
+        # Verify clan exists
+        try:
+            clan = Clan.objects.get(id=clan_id)
+        except Clan.DoesNotExist:
+            return Response({'error': f"Clan '{clan_id}' not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Fetch all player IDs in this clan
+        member_ids = list(clan.members.values_list('id', flat=True))
+
+        # Redis lookup
+        r = get_redis_client()
+        try:
+            key = LeaderboardRedisService.get_key_for_period(game_id, period)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        entries = LeaderboardRedisService.get_subset_leaderboard(
+            r=r,
+            key=key,
+            player_ids=member_ids
+        )
+
+        response_payload = {
+            'game_id': str(game_id),
+            'filter_type': 'clan',
+            'filter_entity_id': clan.id,
+            'period': period,
+            'total_active_members': len(entries),
+            'leaderboard': entries
+        }
+        return Response(response_payload)

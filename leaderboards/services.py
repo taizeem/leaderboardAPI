@@ -272,3 +272,64 @@ class LeaderboardRedisService:
             })
 
         return results
+    @classmethod
+    def get_subset_leaderboard(cls, r: redis.Redis, key: str, player_ids: list, target_player_id: str = None) -> list:
+        """
+        Calculates a relative leaderboard for an arbitrary group of players (e.g. friends, clan).
+        
+        - Uses a single pipeline to extract scores and global ranks in O(M).
+        - Computes local competition ranking with tie handling (1224 ties).
+        - Computes local percentile among the subset.
+        """
+        if not player_ids:
+            return []
+
+        # 1. Pipelined score fetch
+        pipe = r.pipeline()
+        for pid in player_ids:
+            pipe.zscore(key, pid)
+        raw_scores = pipe.execute()
+
+        # 2. Filter out unranked members (score is None)
+        active_entries = []
+        for pid, score in zip(player_ids, raw_scores):
+            if score is not None:
+                active_entries.append((pid, float(score)))
+
+        if not active_entries:
+            return []
+
+        # 3. Sort by score descending
+        active_entries.sort(key=lambda x: x[1], reverse=True)
+
+        total_in_subset = len(active_entries)
+
+        # 4. Pipelined global rank calculation for active subset members
+        rank_pipe = r.pipeline()
+        for pid, score in active_entries:
+            rank_pipe.zcount(key, f"({score}", "+inf")
+        global_higher_counts = rank_pipe.execute()
+
+        # 5. Build results with local 1224 tie handling
+        results = []
+        for idx, ((pid, score), higher_count) in enumerate(zip(active_entries, global_higher_counts)):
+            # Local tie handling
+            if idx > 0 and score == active_entries[idx - 1][1]:
+                local_rank = results[idx - 1]['local_rank']
+            else:
+                local_rank = idx + 1
+
+            # Local percentile: count of players in subset with score <= this score
+            le_count = sum(1 for _, s in active_entries if s <= score)
+            local_percentile = round((le_count / total_in_subset) * 100.0, 2)
+
+            results.append({
+                'player_id': pid,
+                'score': score,
+                'local_rank': local_rank,
+                'global_rank': higher_count + 1,
+                'local_percentile': local_percentile,
+                'is_target_player': (pid == target_player_id) if target_player_id else False
+            })
+
+        return results
