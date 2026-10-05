@@ -20,6 +20,13 @@ class Clan(models.Model):
 class Player(models.Model):
     id = models.CharField(max_length=64, primary_key=True)  # Game-assigned external ID or username
     username = models.CharField(max_length=100)
+    clan = models.ForeignKey(
+        Clan,
+        on_delete= models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='members'
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
