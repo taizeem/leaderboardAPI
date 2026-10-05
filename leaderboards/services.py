@@ -9,7 +9,8 @@ def get_redis_client():
         host=getattr(settings, 'REDIS_HOST', '127.0.0.1'),
         port=getattr(settings, 'REDIS_PORT', 6379),
         db=getattr(settings, 'REDIS_DB', 1),
-        decode_responses=True
+        decode_responses=True,
+        protocol=2
     )
 
 class LeaderboardRedisService:
