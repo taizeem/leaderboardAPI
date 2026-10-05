@@ -54,10 +54,7 @@ REDIS_PORT = int(os.environ.get('REDIS_PORT', 6379))
 REDIS_DB = int(os.environ.get('REDIS_DB', 1))
 CHANNEL_LAYERS = {
     "default": {
-        "BACKEND": "channels_redis.core.RedisChannelLayer",
-        "CONFIG": {
-            "hosts": [(REDIS_HOST, REDIS_PORT)],
-        },
+        "BACKEND": "channels.layers.InMemoryChannelLayer",
     },
 }
 REST_FRAMEWORK = {

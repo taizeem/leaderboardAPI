@@ -45,17 +45,32 @@ class LeaderboardRedisService:
     @classmethod
     def record_score(cls, r: redis.Redis, game_id: str, player_id: str, score: float):
         """
-        Atomically updates the player's best score and applies automatic TTL to transient sets.
+        Updates the player's score across daily, weekly, and all-time boards 
+        only if the new score is strictly greater than their current score.
+        Fully compatible with Redis 5.0+.
         """
         keys = cls.get_period_keys(game_id)
+
+        # 1. Pipeline check of current scores across all periods
         pipe = r.pipeline()
-        for period_type, key in keys.items():
-            pipe.zadd(key, {player_id: score}, gt=True)
-            ttl = cls.RETENTION_CONFIG.get(period_type)
-            if ttl:
-                # nx=True sets expiration only if key does not have an active TTL already
-                pipe.expire(key, ttl, nx=True)
-        pipe.execute()
+        for key in keys.values():
+            pipe.zscore(key, player_id)
+        current_scores = pipe.execute()
+
+        # 2. Update boards where new score is higher or player has no score yet
+        update_pipe = r.pipeline()
+        has_updates = False
+
+        for (period_type, key), current in zip(keys.items(), current_scores):
+            if current is None or score > float(current):
+                update_pipe.zadd(key, {player_id: score})
+                ttl = cls.RETENTION_CONFIG.get(period_type)
+                if ttl:
+                    update_pipe.expire(key, ttl)
+                has_updates = True
+
+        if has_updates:
+            update_pipe.execute()
 
     @classmethod
     def calculate_rank(cls, r: redis.Redis, key: str, score: float) -> int:
