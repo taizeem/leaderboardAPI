@@ -7,7 +7,7 @@ from django.core.management import call_command
 from django.test import TestCase
 from rest_framework.test import APIClient
 from rest_framework import status
-from games.models import Game, Player
+from games.models import Game, Player, Clan, Friendship
 from leaderboards.services import LeaderboardRedisService
 from leaderboards.models import ArchivedLeaderboardEntry
 from channels.testing import WebsocketCommunicator
@@ -370,3 +370,104 @@ class LeaderboardWebSocketTests(TestCase):
         self.assertEqual(broadcast["payload"]["rank"], 1)
 
         await communicator.disconnect()
+
+
+class SocialLeaderboardTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.fake_redis = fakeredis.FakeRedis(decode_responses=True)
+
+        self.redis_patcher = patch(
+            'leaderboards.views.get_redis_client',
+            return_value=self.fake_redis
+        )
+        self.redis_patcher.start()
+
+        self.game = Game.objects.create(name="StrikeForce")
+
+        # Create Clan
+        self.clan_alpha = Clan.objects.create(id="alpha", name="Alpha Wolves", tag="[AW]")
+        self.clan_bravo = Clan.objects.create(id="bravo", name="Bravo Guard", tag="[BG]")
+
+        # Create Players
+        self.p1 = Player.objects.create(id="p1", username="Alice", clan=self.clan_alpha)
+        self.p2 = Player.objects.create(id="p2", username="Bob", clan=self.clan_alpha)
+        self.p3 = Player.objects.create(id="p3", username="Charlie", clan=self.clan_alpha)
+        self.outsider = Player.objects.create(id="outsider", username="Dave", clan=self.clan_bravo)
+
+        # Establish Friendships: Alice is friends with Bob and Dave (outsider)
+        Friendship.objects.create(player=self.p1, friend=self.p2)
+        Friendship.objects.create(player=self.p1, friend=self.outsider)
+
+        # Seed global scores in Redis:
+        # Dave (outsider) = 1000.0 (Global Rank 1)
+        # Alice (p1)      = 800.0  (Global Rank 2, tied)
+        # Bob (p2)        = 800.0  (Global Rank 2, tied)
+        # Charlie (p3)    = 500.0  (Global Rank 4)
+        for pid, score in [("outsider", 1000.0), ("p1", 800.0), ("p2", 800.0), ("p3", 500.0)]:
+            LeaderboardRedisService.record_score(
+                r=self.fake_redis,
+                game_id=str(self.game.id),
+                player_id=pid,
+                score=score
+            )
+
+    def tearDown(self):
+        self.redis_patcher.stop()
+
+    def test_friends_leaderboard_includes_only_friends_with_relative_and_global_ranks(self):
+        """
+        Alice queries her friends leaderboard.
+        Expected members: Alice, Bob, and Dave (Charlie is excluded because not Alice's friend).
+        """
+        url = f"/api/leaderboards/{self.game.id}/friends/{self.p1.id}/"
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        data = resp.data['leaderboard']
+        self.assertEqual(len(data), 3)
+
+        # Check members and ranks
+        # Rank 1: Dave (score 1000.0) -> Local 1, Global 1
+        self.assertEqual(data[0]['player_id'], 'outsider')
+        self.assertEqual(data[0]['local_rank'], 1)
+        self.assertEqual(data[0]['global_rank'], 1)
+
+        # Rank 2 (Tied): Alice and Bob both have 800.0 -> Local 2, Global 2
+        self.assertEqual(data[1]['score'], 800.0)
+        self.assertEqual(data[1]['local_rank'], 2)
+        self.assertEqual(data[1]['global_rank'], 2)
+
+        self.assertEqual(data[2]['score'], 800.0)
+        self.assertEqual(data[2]['local_rank'], 2)
+        self.assertEqual(data[2]['global_rank'], 2)
+
+        # Target player flag check
+        alice_entry = next(entry for entry in data if entry['player_id'] == 'p1')
+        self.assertTrue(alice_entry['is_target_player'])
+
+    def test_clan_leaderboard_isolates_clan_members(self):
+        """
+        Query Alpha clan: Alice, Bob, Charlie must be included.
+        Dave (Bravo clan) must be excluded even though he has the highest score globally.
+        """
+        url = f"/api/leaderboards/{self.game.id}/clan/{self.clan_alpha.id}/"
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        data = resp.data['leaderboard']
+        self.assertEqual(len(data), 3)
+
+        # Local ranks in Alpha clan:
+        # Alice (800) -> Local 1, Global 2
+        # Bob (800)   -> Local 1, Global 2 (Tied for Local 1!)
+        # Charlie (500) -> Local 3 (Skipped Local 2), Global 4
+        pids = [entry['player_id'] for entry in data]
+        self.assertIn('p1', pids)
+        self.assertIn('p2', pids)
+        self.assertIn('p3', pids)
+        self.assertNotIn('outsider', pids)
+
+        charlie_entry = next(entry for entry in data if entry['player_id'] == 'p3')
+        self.assertEqual(charlie_entry['local_rank'], 3)
+        self.assertEqual(charlie_entry['global_rank'], 4)
