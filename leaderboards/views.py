@@ -5,9 +5,9 @@ from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 from django.db.models import Q
 from games.models import Clan, Friendship, Player
-from .serializers import FilteredLeaderboardResponseSerializer
+from .security import HasValidHMACSignature, PlayerScoreThrottle
 
-from .models import ScoreSubmission
+
 from .serializers import (
     ScoreSubmissionSerializer,
     LeaderboardEntrySerializer,
@@ -15,11 +15,41 @@ from .serializers import (
 )
 from .services import LeaderboardRedisService, get_redis_client
 
+def enrich_player_metadata(entries: list) -> list:
+    """
+    Enriches a list of leaderboard entries with player username, clan tag,
+    and clan name from the database in a single batched query.
+    """
+    if not entries:
+        return entries
+
+    player_ids = [entry['player_id'] for entry in entries if 'player_id' in entry]
+    players = Player.objects.filter(id__in=player_ids).select_related('clan')
+
+    player_map = {
+        p.id: {
+            'username': p.username,
+            'clan_tag': p.clan.tag if p.clan else None,
+            'clan_name': p.clan.name if p.clan else None,
+        }
+        for p in players
+    }
+
+    for entry in entries:
+        p_id = entry.get('player_id')
+        meta = player_map.get(p_id, {'username': p_id, 'clan_tag': None, 'clan_name': None})
+        entry['username'] = meta['username']
+        entry['clan_tag'] = meta['clan_tag']
+        entry['clan_name'] = meta['clan_name']
+
+    return entries
 class SubmitScoreView(APIView):
     """
     Ingests score, updates Redis real-time indices, and broadcasts
     the rank update to WebSocket listeners via Redis Pub/Sub.
     """
+    permission_classes = [HasValidHMACSignature]
+    throttle_classes= [PlayerScoreThrottle]
     def post(self, request):
         serializer = ScoreSubmissionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -39,31 +69,42 @@ class SubmitScoreView(APIView):
         )
 
         # 2. Broadcast updates to active WebSocket subscribers
-        channel_layer = get_channel_layer()
         periods = ['daily', 'weekly', 'all_time']
+        standings_summary = {}
 
         for period in periods:
             key = LeaderboardRedisService.get_key_for_period(game_id, period)
-            player_rank = LeaderboardRedisService.calculate_rank(r, key, score)
-            top_10 = LeaderboardRedisService.get_top_n(r, key, 10)
-
-            payload = {
-                "player_id": player_id,
-                "score": score,
-                "rank": player_rank,
-                "period": period,
-                "top_10": top_10
+            rank = LeaderboardRedisService.calculate_rank(r, key, score)
+            percentile = LeaderboardRedisService.calculate_percentile(r, key, score)
+            standings_summary[period] = {
+                'rank': rank,
+                'percentile': percentile
             }
+            channel_layer = get_channel_layer()
+            if channel_layer:
+                for period in periods:
+                    key = LeaderboardRedisService.get_key_for_period(game_id, period)
+                    top_10 = LeaderboardRedisService.get_top_n(r, key, 10)
+                    enrich_player_metadata(top_10)
 
-            group_name = f"leaderboard_{game_id}_{period}"
-            async_to_sync(channel_layer.group_send)(
-                group_name,
-                {
-                    "type": "leaderboard_update",
-                    "payload": payload,
-                }
-            )
-
+                    payload = {
+                        "player_id": player_id,
+                        "score": score,
+                        "rank": standings_summary[period]['rank'],
+                        "percentile": standings_summary[period]['percentile'],
+                        "period": period,
+                        "top_10": top_10
+                    }
+                    group_name = f"leaderboard_{game_id}_{period}"
+                    async_to_sync(channel_layer.group_send)(
+                        group_name,
+                        {
+                            "type": "leaderboard_update",
+                            "payload": payload,
+                        }
+                    )
+        response_data = serializer.data
+        response_data['current_standings'] = standings_summary
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 

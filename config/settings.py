@@ -60,6 +60,9 @@ CHANNEL_LAYERS = {
 REST_FRAMEWORK = {
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 50,
+    'DEFAULT_THROTTLE_RATES': {
+        'score_submission': '10/minute',  # Max 10 score posts per minute per player
+    },
 }
 
 REDIS_HOST = '127.0.0.1'

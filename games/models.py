@@ -1,6 +1,9 @@
 from django.db import models
 import uuid
+import secrets
 
+def generate_api_secret():
+    return secrets.token_hex(32)
 class Game(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=100, unique=True)
